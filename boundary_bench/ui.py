@@ -1,0 +1,274 @@
+import json
+from typing import List, Optional
+from fastapi.testclient import TestClient
+import streamlit as st
+
+from boundary_bench.advisor import (
+    DEFAULT_MODEL,
+    DETERMINISTIC_FALLBACK_TESTS,
+    check_ollama_available,
+    get_installed_models,
+    suggest_authorization_tests,
+)
+from boundary_bench.app_secure import app_secure
+from boundary_bench.app_vulnerable import app_vulnerable
+from boundary_bench.models import SuggestedTestCase, TestRunReport
+from boundary_bench.runner import SecurityTestRunner
+
+st.set_page_config(
+    page_title="BoundaryBench",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Custom minimal security theme CSS
+st.markdown(
+    """
+    <style>
+    .metric-card {
+        background-color: #f8f9fa;
+        border-radius: 8px;
+        padding: 12px;
+        border: 1px solid #e9ecef;
+    }
+    .badge-pass {
+        background-color: #d1e7dd;
+        color: #0f5132;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+    .badge-fail {
+        background-color: #f8d7da;
+        color: #842029;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+    .badge-inconclusive {
+        background-color: #fff3cd;
+        color: #664d03;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+    .badge-error {
+        background-color: #cfe2ff;
+        color: #084298;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- Header ---
+st.title("🛡️ BoundaryBench")
+st.markdown(
+    "**Local-first, AI-assisted API authorization testing tool.** "
+    "Uses local Gemma 4 E2B via Ollama for test scenario suggestion with deterministic Python execution."
+)
+
+# --- Sidebar: Configuration & Environment Status ---
+with st.sidebar:
+    st.header("⚙️ Configuration")
+
+    st.subheader("Target Demo Mode")
+    demo_mode = st.radio(
+        "Select API Mode:",
+        ["Vulnerable (BOLA/IDOR Active)", "Secure (Strict Ownership)"],
+        index=0,
+        help="Switch between the intentionally vulnerable API and the hardened secure API.",
+    )
+    is_vulnerable = "Vulnerable" in demo_mode
+    target_app = app_vulnerable if is_vulnerable else app_secure
+
+    st.divider()
+
+    st.subheader("🔌 Ollama Status")
+    ollama_online = check_ollama_available()
+    if ollama_online:
+        installed_models = get_installed_models()
+        model_available = DEFAULT_MODEL in installed_models
+        st.success(f"Ollama Server: Online")
+        if model_available:
+            st.info(f"Target Model: `{DEFAULT_MODEL}` Ready")
+        else:
+            st.warning(f"Tag `{DEFAULT_MODEL}` missing. Installed: {installed_models}")
+    else:
+        st.error("Ollama Server: Offline (http://127.0.0.1:11434)")
+        st.caption("Deterministic fallback generator available.")
+
+    st.divider()
+    st.subheader("📋 Synthetic Data Reference")
+    st.markdown(
+        "- **alice**: owns `rec-alice-101` (GPA 3.90)\n"
+        "- **bob**: owns `rec-bob-202` (GPA 2.70, probation notes)\n"
+        "- Endpoint: `GET /records/{record_id}`\n"
+        "- Auth Header: `x-user: <username>`"
+    )
+
+# --- Session State Initialization ---
+if "proposed_tests" not in st.session_state:
+    st.session_state["proposed_tests"] = None
+if "test_source" not in st.session_state:
+    st.session_state["test_source"] = None
+if "report" not in st.session_state:
+    st.session_state["report"] = None
+
+# --- Section 1: Test Case Generation ---
+st.header("1. Proposed Security Tests")
+
+col_gen1, col_gen2 = st.columns([1, 1])
+
+with col_gen1:
+    if st.button("✨ Suggest Tests via Gemma 4 E2B", type="primary", use_container_width=True):
+        with st.spinner("Querying local Gemma 4 E2B via Ollama..."):
+            advisor_out = suggest_authorization_tests(timeout=35.0)
+            st.session_state["proposed_tests"] = advisor_out.get("tests", [])
+            st.session_state["test_source"] = advisor_out.get("source", "unknown")
+            if "reason" in advisor_out:
+                st.session_state["advisor_reason"] = advisor_out.get("reason")
+            else:
+                st.session_state.pop("advisor_reason", None)
+            st.session_state["report"] = None
+
+with col_gen2:
+    if st.button("📦 Load Deterministic Benchmark Suite", use_container_width=True):
+        st.session_state["proposed_tests"] = list(DETERMINISTIC_FALLBACK_TESTS)
+        st.session_state["test_source"] = "deterministic-baseline"
+        st.session_state.pop("advisor_reason", None)
+        st.session_state["report"] = None
+
+# Show advisor source/note
+if st.session_state.get("test_source"):
+    src = st.session_state["test_source"]
+    if "ollama" in src:
+        st.success(f"Tests generated by local LLM: `{src}`")
+    else:
+        st.info(f"Test source: `{src}`")
+    if "advisor_reason" in st.session_state:
+        st.caption(f"Note: {st.session_state['advisor_reason']}")
+
+# --- Section 2: Review Proposed Tests ---
+proposed: Optional[List[SuggestedTestCase]] = st.session_state.get("proposed_tests")
+
+if proposed:
+    st.subheader("2. Review Validated Scenarios Before Execution")
+    
+    test_rows = []
+    for idx, t in enumerate(proposed, 1):
+        test_rows.append(
+            {
+                "#": idx,
+                "Type": t.test_type,
+                "Authenticated User": t.authenticated_user,
+                "Target Record ID": t.target_record_id,
+                "Expected Owner": t.expected_owner,
+                "Secure Baseline HTTP": t.expected_status_code,
+                "Description": t.description,
+            }
+        )
+    st.dataframe(test_rows, use_container_width=True, hide_index=True)
+
+    # --- Section 3: Execute Tests ---
+    st.header("3. Execution")
+    exec_col1, exec_col2 = st.columns([1, 3])
+    with exec_col1:
+        run_clicked = st.button("🚀 Run Security Tests", type="primary", use_container_width=True)
+
+    if run_clicked:
+        with st.spinner("Executing controlled tests against local target..."):
+            with TestClient(target_app) as client:
+                runner = SecurityTestRunner(client=client, base_url="http://testserver")
+                report: TestRunReport = runner.run_tests(proposed)
+                st.session_state["report"] = report
+
+# --- Section 4: Results & Sanitized Evidence ---
+report: Optional[TestRunReport] = st.session_state.get("report")
+
+if report:
+    st.header("4. Test Results & Evidence")
+
+    # Metrics Summary Bar
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total Executed", report.total_tests)
+    m2.metric("Passed Checks", report.passed)
+    m3.metric("Failed Checks", report.failed)
+    m4.metric("Inconclusive", report.inconclusive)
+    m5.metric("Findings (BOLA)", report.findings_count)
+
+    if report.findings_count > 0:
+        st.error(
+            f"⚠️ **{report.findings_count} Authorization Finding(s) Detected!** "
+            "Confidential cross-user records were exposed."
+        )
+    else:
+        st.success("✅ **Authorization Boundaries Enforced.** No cross-user leaks detected.")
+
+    st.subheader("Detailed Execution Records & Evidence")
+
+    for idx, rec in enumerate(report.records, 1):
+        outcome_color = {
+            "PASS": "badge-pass",
+            "FAIL": "badge-fail",
+            "INCONCLUSIVE": "badge-inconclusive",
+            "ERROR": "badge-error",
+        }.get(rec.outcome, "badge-inconclusive")
+
+        finding_alert = "⚠️ VULNERABILITY FOUND" if rec.finding_detected else "OK"
+
+        with st.expander(
+            f"Test {idx}: {rec.test_id} — {rec.outcome} ({finding_alert})",
+            expanded=rec.finding_detected,
+        ):
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.markdown(f"**Endpoint:** `{rec.endpoint}`")
+                st.markdown(f"**Expected:** {rec.expected_behavior}")
+            with c2:
+                st.markdown(f"**Outcome:** <span class='{outcome_color}'>{rec.outcome}</span>", unsafe_allow_html=True)
+                st.markdown(f"**Observed:** {rec.observed_behavior}")
+
+            st.markdown("#### Sanitized Evidence")
+            ev = rec.evidence
+            e_col1, e_col2 = st.columns([1, 2])
+            with e_col1:
+                st.write("**Request Target:**", f"`{ev.http_method} {ev.target_url}`")
+                st.write("**HTTP Status:**", ev.response_status_code or "N/A")
+                st.write("**Protected Data Leaked:**", "🚨 YES" if ev.protected_data_exposed else "No")
+                if ev.exposed_fields:
+                    st.write("**Exposed Fields:**", ev.exposed_fields)
+
+            with e_col2:
+                st.write("**Request Headers (Sanitized):**")
+                st.json(ev.request_headers)
+
+                if ev.response_body_snippet:
+                    st.write("**Response Body Snippet:**")
+                    st.json(ev.response_body_snippet)
+
+            if rec.error_detail:
+                st.error(f"Error detail: {rec.error_detail}")
+
+    # --- Section 5: Export Report ---
+    st.divider()
+    st.subheader("5. Export Report")
+    json_data = report.model_dump_json(indent=2)
+    st.download_button(
+        label="📥 Export Report as JSON",
+        data=json_data,
+        file_name="boundarybench_report.json",
+        mime="application/json",
+        use_container_width=False,
+    )
+else:
+    if not proposed:
+        st.info("👈 Step 1: Click a button above to generate or load authorization test cases.")
